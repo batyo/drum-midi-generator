@@ -439,18 +439,25 @@ namespace DrumMidiGenerator
     }
 
     // =====================================================================
-    // オンセット検出 + 楽器分類 (マルチバンド方式)
+    // オンセット検出 + 楽器分類 (マルチバンド方式 + HFC + 中央値適応しきい値)
     //
     // アルゴリズム概要:
     //  1. 全フレームのFFTマグニチュードを対数圧縮 log(1+|X|) してスペクトログラムを作成
     //     -> 振幅の小さい音も検出しやすくするための圧縮
-    //  2. Kick/Snare/HiHatそれぞれの周波数帯ごとに、帯域限定スペクトラルフラックスを計算
+    //  2. Kick/Snare/HiHatそれぞれの周波数帯ごとに、帯域限定の検出関数を計算:
+    //       - フラックス成分: log(1+|X|) の正の差分の和 (音色変化に敏感)
+    //       - HFC成分      : (bin番号で重み付けした) 振幅の差分の和 (高域の急峻なアタックに敏感)
+    //     2つを合成したものを最終的な検出関数として使用する
     //     -> 1つの帯域が他帯域に埋もれて検出漏れするのを防ぐ (ポリフォニック検出)
-    //  3. 各帯域で適応的しきい値によるピーク検出
-    //  4. ピーク検出されたフレームについて、そのフレーム内で対象帯域のエネルギー比が
+    //  3. 各帯域で「中央値 + MAD(中央絶対偏差) × 係数」による適応的しきい値でピーク検出
+    //     -> 平均値ベースに比べて突発的な大音量区間に閾値が引っ張られにくい
+    //  4. ピーク周辺3点の放物線補間でサブフレーム精度の発音時刻を推定
+    //  5. ピーク検出されたフレームについて、そのフレーム内で対象帯域のエネルギー比が
     //     一定以上かを確認 (クロスバンド確認チェック)
     //     -> 他楽器の過渡音が漏れ込んで誤検出するのを抑制
-    //  5. 楽器ごとにフラックス強度を正規化してベロシティを算出
+    //  6. 楽器ごとに強度のパーセンタイル分布を使ってベロシティへマッピング
+    //     -> 曲全体の最大値1つに引っ張られず、強弱のレンジ全体を有効活用する
+    //  7. 極端に近接したノート(数msオーダー)をマージして冗長な発音を抑制
     //
     // 注意: ヒューリスティック(経験則)による分類です。クラッシュ/ライド/タムの区別、
     //       オープン/クローズハイハットの判定などは含まれていません。
@@ -463,17 +470,20 @@ namespace DrumMidiGenerator
 
         // ピーク検出パラメータ
         private const int PeakSpread = 2;         // 局所最大値判定の幅 (フレーム数)
-        private const int AdaptiveAvgWindow = 12; // 適応的しきい値の移動平均幅
+        private const int AdaptiveMedianWindow = 16; // 適応的しきい値の中央値計算窓 (片側フレーム数)
+
+        // 検出関数の合成比率 (フラックス成分 + HFC成分)
+        private const double HfcWeight = 0.6; // 0.0でフラックスのみ、大きいほどHFCの寄与が増える
 
         // 周波数帯の境界 (Hz)
         private const double KickLoHz = 20, KickHiHz = 150;
         private const double SnareLoHz = 150, SnareHiHz = 2500;
         private const double HiHatLoHz = 2500, HiHatHiHz = 12000;
 
-        // 帯域ごとのしきい値の倍率 (大きいほど検出されにくくなる)
-        private const double KickThresholdMul = 1.5;
-        private const double SnareThresholdMul = 1.6;
-        private const double HiHatThresholdMul = 1.8;
+        // 帯域ごとのしきい値の係数 (MADに掛ける倍率。大きいほど検出されにくくなる)
+        private const double KickThresholdMul = 3.0;
+        private const double SnareThresholdMul = 3.2;
+        private const double HiHatThresholdMul = 3.5;
 
         // 帯域ごとの最小オンセット間隔 (秒)
         private const double KickMinGap = 0.08;
@@ -487,8 +497,11 @@ namespace DrumMidiGenerator
         private const double HiHatRatioMin = 0.30;
 
         // ベロシティの最小値・最大値
-        private const int VelocityMin = 50;
-        private const int VelocityRange = 77; // VelocityMin + VelocityRange = 127
+        private const int VelocityMin = 45;
+        private const int VelocityRange = 82; // VelocityMin + VelocityRange = 127
+
+        // 異なる楽器間でこの間隔(秒)未満で連続する場合、弱い方をゴーストノートとして抑制
+        private const double MergeWindowSeconds = 0.012;
 
         private readonly double _sensitivity;
 
@@ -505,8 +518,9 @@ namespace DrumMidiGenerator
             int numFrames = (samples.Length - WindowSize) / HopSize + 1;
             if (numFrames <= 0) return new List<Onset>();
 
-            // --- スペクトログラム (対数圧縮マグニチュード) を作成 ---
+            // --- スペクトログラム (生マグニチュード + 対数圧縮マグニチュード) を作成 ---
             double[] window = HannWindow(WindowSize);
+            var mag = new double[numFrames][];
             var logMag = new double[numFrames][];
 
             for (int f = 0; f < numFrames; f++)
@@ -521,9 +535,14 @@ namespace DrumMidiGenerator
                 }
                 FFT.Transform(buf);
 
+                var m = new double[WindowSize / 2];
                 var lm = new double[WindowSize / 2];
-                for (int i = 0; i < lm.Length; i++)
-                    lm[i] = Math.Log(1.0 + buf[i].Magnitude);
+                for (int i = 0; i < m.Length; i++)
+                {
+                    m[i] = buf[i].Magnitude;
+                    lm[i] = Math.Log(1.0 + m[i]);
+                }
+                mag[f] = m;
                 logMag[f] = lm;
             }
 
@@ -538,58 +557,49 @@ namespace DrumMidiGenerator
             // クロスバンド比較に使う全体範囲 (打楽器が主に存在する帯域)
             int totalLo = kickLo, totalHi = hihatHi;
 
-            var kickOnsets = DetectBand(logMag, numFrames, sr, kickLo, kickHi,
+            var kickOnsets = DetectBand(mag, logMag, numFrames, sr, kickLo, kickHi,
                 KickThresholdMul, KickMinGap, DrumMap.Kick,
                 f => BandRatio(logMag[f], kickLo, kickHi, totalLo, totalHi) >= KickRatioMin);
 
-            var snareOnsets = DetectBand(logMag, numFrames, sr, snareLo, snareHi,
+            var snareOnsets = DetectBand(mag, logMag, numFrames, sr, snareLo, snareHi,
                 SnareThresholdMul, SnareMinGap, DrumMap.Snare,
                 f => BandRatio(logMag[f], snareLo, snareHi, totalLo, totalHi) >= SnareRatioMin);
 
-            var hihatOnsets = DetectBand(logMag, numFrames, sr, hihatLo, hihatHi,
+            var hihatOnsets = DetectBand(mag, logMag, numFrames, sr, hihatLo, hihatHi,
                 HiHatThresholdMul, HiHatMinGap, DrumMap.ClosedHiHat,
                 f => BandRatio(logMag[f], hihatLo, hihatHi, totalLo, totalHi) >= HiHatRatioMin);
 
-            // 楽器ごとにベロシティを正規化 (キックとハイハットでエネルギー量のスケールが異なるため)
-            NormalizeVelocity(kickOnsets);
-            NormalizeVelocity(snareOnsets);
-            NormalizeVelocity(hihatOnsets);
+            // 楽器ごとにパーセンタイル分布を使ってベロシティをマッピング
+            MapVelocityByPercentile(kickOnsets);
+            MapVelocityByPercentile(snareOnsets);
+            MapVelocityByPercentile(hihatOnsets);
 
             var all = new List<Onset>();
             all.AddRange(kickOnsets);
             all.AddRange(snareOnsets);
             all.AddRange(hihatOnsets);
             all.Sort((a, b) => a.TimeSeconds.CompareTo(b.TimeSeconds));
-            return all;
+
+            return MergeGhostNotes(all);
         }
 
         /// <summary>
-        /// 指定した周波数帯について帯域限定スペクトラルフラックスを計算し、
-        /// 適応的しきい値でピーク検出を行う。confirmCheckで誤検出を除外する。
+        /// 指定した周波数帯について「対数フラックス + HFC」の合成検出関数を計算し、
+        /// 中央値+MADベースの適応的しきい値でピーク検出を行う。
+        /// confirmCheckで誤検出を除外し、放物線補間でサブフレーム精度の時刻を求める。
         /// </summary>
         private List<Onset> DetectBand(
-            double[][] logMag, int numFrames, int sr,
+            double[][] mag, double[][] logMag, int numFrames, int sr,
             int bandLo, int bandHi, double thresholdMul, double minGapSec, int midiNote,
             Func<int, bool> confirmCheck)
         {
             var result = new List<Onset>();
 
-            var flux = new double[numFrames];
-            for (int f = 1; f < numFrames; f++)
-            {
-                double sum = 0;
-                var prev = logMag[f - 1];
-                var cur = logMag[f];
-                for (int i = bandLo; i <= bandHi; i++)
-                {
-                    double diff = cur[i] - prev[i];
-                    if (diff > 0) sum += diff;
-                }
-                flux[f] = sum;
-            }
+            // 対数フラックス成分とHFC成分を正規化した上で合成した検出関数
+            double[] detFunc = CombineNormalized(mag, logMag, numFrames, bandLo, bandHi);
 
-            double maxFlux = flux.Max();
-            if (maxFlux <= 0) return result;
+            double maxDet = detFunc.Length > 0 ? detFunc.Max() : 0;
+            if (maxDet <= 0) return result;
 
             double lastTime = -1;
             for (int f = PeakSpread; f < numFrames - PeakSpread; f++)
@@ -597,28 +607,31 @@ namespace DrumMidiGenerator
                 bool isPeak = true;
                 for (int k = -PeakSpread; k <= PeakSpread; k++)
                 {
-                    if (k != 0 && flux[f] < flux[f + k]) { isPeak = false; break; }
+                    if (k != 0 && detFunc[f] < detFunc[f + k]) { isPeak = false; break; }
                 }
-                if (!isPeak) continue;
+                if (!isPeak || detFunc[f] <= 0) continue;
 
-                int lo = Math.Max(0, f - AdaptiveAvgWindow);
-                int hi = Math.Min(numFrames - 1, f + AdaptiveAvgWindow);
-                double localAvg = 0;
-                for (int k = lo; k <= hi; k++) localAvg += flux[k];
-                localAvg /= (hi - lo + 1);
+                int lo = Math.Max(0, f - AdaptiveMedianWindow);
+                int hi = Math.Min(numFrames - 1, f + AdaptiveMedianWindow);
+                double median = Median(detFunc, lo, hi);
+                double mad = MedianAbsoluteDeviation(detFunc, lo, hi, median);
 
-                double threshold = localAvg * thresholdMul * _sensitivity + maxFlux * 0.01;
-                if (flux[f] <= threshold) continue;
+                // MADが極端に小さい(無音区間など)場合のフォールバック
+                double effectiveMad = Math.Max(mad, maxDet * 0.005);
+                double threshold = (median + effectiveMad * thresholdMul) * _sensitivity;
+                if (detFunc[f] <= threshold) continue;
 
-                double time = (double)(f * HopSize) / sr;
+                // 放物線補間でサブフレーム精度のピーク位置を推定
+                double frac = ParabolicInterpolationOffset(detFunc[f - 1], detFunc[f], detFunc[f + 1]);
+                double time = ((f + frac) * HopSize) / sr;
+
                 if (lastTime >= 0 && (time - lastTime) < minGapSec) continue;
-
                 if (!confirmCheck(f)) continue;
 
                 result.Add(new Onset
                 {
-                    TimeSeconds = time,
-                    Strength = flux[f],
+                    TimeSeconds = Math.Max(0, time),
+                    Strength = detFunc[f],
                     MidiNote = midiNote,
                     Velocity = 0
                 });
@@ -626,6 +639,81 @@ namespace DrumMidiGenerator
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// 対数フラックス成分とHFC成分をそれぞれ独立に正規化してから合成する。
+        /// スケールの異なる2つの検出関数を公平に足し合わせるための処理。
+        /// </summary>
+        private double[] CombineNormalized(double[][] mag, double[][] logMag, int numFrames, int bandLo, int bandHi)
+        {
+            var fluxArr = new double[numFrames];
+            var hfcArr = new double[numFrames];
+
+            for (int f = 1; f < numFrames; f++)
+            {
+                double fluxSum = 0, hfcSum = 0;
+                var prevLog = logMag[f - 1];
+                var curLog = logMag[f];
+                var prevMag = mag[f - 1];
+                var curMag = mag[f];
+
+                for (int i = bandLo; i <= bandHi; i++)
+                {
+                    double fluxDiff = curLog[i] - prevLog[i];
+                    if (fluxDiff > 0) fluxSum += fluxDiff;
+
+                    double hfcDiff = curMag[i] - prevMag[i];
+                    if (hfcDiff > 0) hfcSum += hfcDiff * (i + 1);
+                }
+                fluxArr[f] = fluxSum;
+                hfcArr[f] = hfcSum;
+            }
+
+            double fluxMax = fluxArr.Max();
+            double hfcMax = hfcArr.Max();
+            if (fluxMax <= 0) fluxMax = 1;
+            if (hfcMax <= 0) hfcMax = 1;
+
+            var combined = new double[numFrames];
+            for (int f = 0; f < numFrames; f++)
+            {
+                double nf = fluxArr[f] / fluxMax;
+                double nh = hfcArr[f] / hfcMax;
+                combined[f] = (1.0 - HfcWeight) * nf + HfcWeight * nh;
+            }
+            return combined;
+        }
+
+        /// <summary>
+        /// y0,y1,y2 (フレーム f-1, f, f+1 の値) から放物線補間し、
+        /// フレームfからのオフセット(-0.5〜+0.5程度)を返す。
+        /// </summary>
+        private static double ParabolicInterpolationOffset(double y0, double y1, double y2)
+        {
+            double denom = y0 - 2 * y1 + y2;
+            if (Math.Abs(denom) < 1e-12) return 0.0;
+            double offset = 0.5 * (y0 - y2) / denom;
+            return Math.Clamp(offset, -0.5, 0.5);
+        }
+
+        private static double Median(double[] arr, int lo, int hi)
+        {
+            var slice = new double[hi - lo + 1];
+            Array.Copy(arr, lo, slice, 0, slice.Length);
+            Array.Sort(slice);
+            int n = slice.Length;
+            return n % 2 == 1 ? slice[n / 2] : (slice[n / 2 - 1] + slice[n / 2]) / 2.0;
+        }
+
+        private static double MedianAbsoluteDeviation(double[] arr, int lo, int hi, double median)
+        {
+            var dev = new double[hi - lo + 1];
+            for (int i = lo; i <= hi; i++) dev[i - lo] = Math.Abs(arr[i] - median);
+            Array.Sort(dev);
+            int n = dev.Length;
+            double mad = n % 2 == 1 ? dev[n / 2] : (dev[n / 2 - 1] + dev[n / 2]) / 2.0;
+            return mad * 1.4826; // 正規分布を仮定した標準偏差相当へのスケーリング
         }
 
         /// <summary>
@@ -640,13 +728,44 @@ namespace DrumMidiGenerator
             return bandSum / totalSum;
         }
 
-        private static void NormalizeVelocity(List<Onset> onsets)
+        /// <summary>
+        /// 強度のパーセンタイル順位を使ってベロシティにマッピングする。
+        /// 1曲の中の最大値1点に引っ張られず、強弱のレンジを有効活用できる。
+        /// </summary>
+        private static void MapVelocityByPercentile(List<Onset> onsets)
         {
             if (onsets.Count == 0) return;
-            double max = onsets.Max(o => o.Strength);
-            if (max <= 0) max = 1;
-            foreach (var o in onsets)
-                o.Velocity = (int)Math.Clamp(VelocityMin + (o.Strength / max) * VelocityRange, 1, 127);
+            var sorted = onsets.OrderBy(o => o.Strength).ToList();
+            int n = sorted.Count;
+            for (int i = 0; i < n; i++)
+            {
+                double percentile = n == 1 ? 1.0 : (double)i / (n - 1);
+                sorted[i].Velocity = (int)Math.Clamp(VelocityMin + percentile * VelocityRange, 1, 127);
+            }
+        }
+
+        /// <summary>
+        /// 異なる楽器のノートが極端に近接している場合、弱い方をゴーストノートとして除去する。
+        /// 同一楽器内の連打(16分のハイハットなど)は対象外。
+        /// </summary>
+        private static List<Onset> MergeGhostNotes(List<Onset> sortedOnsets)
+        {
+            if (sortedOnsets.Count < 2) return sortedOnsets;
+
+            var result = new List<Onset>(sortedOnsets);
+            for (int i = 0; i < result.Count - 1; i++)
+            {
+                var a = result[i];
+                var b = result[i + 1];
+                if (a.MidiNote == b.MidiNote) continue; // 同一楽器は対象外
+                if ((b.TimeSeconds - a.TimeSeconds) >= MergeWindowSeconds) continue;
+
+                // 弱い方を除去
+                var weaker = a.Velocity <= b.Velocity ? a : b;
+                result.Remove(weaker);
+                i = Math.Max(-1, i - 1); // 削除した分インデックスを調整して再評価
+            }
+            return result;
         }
 
         private static double[] HannWindow(int size)
