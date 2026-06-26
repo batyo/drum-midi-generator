@@ -1,21 +1,24 @@
 ﻿// =====================================================================
-// DrumMidiGenerator
+// DrumMidiGenerator (Omnizart版)
 // ---------------------------------------------------------------------
 // パイプライン:
 //   1. FFmpeg        : MP3 -> WAV (44.1kHz / 16bit / stereo)
-//   2. Demucs        : ドラムスステムを分離 (外部プロセス, Python)
-//   3. C# 解析       : ドラムWAVをFFT解析してオンセット検出・楽器分類
-//   4. MIDI出力      : Cakewalk SONARで読み込めるSMF Format1ファイルを生成
+//   2. Demucs        : ドラムスステムを分離 (外部プロセス, Python venv)
+//   3. Omnizart      : ドラムWAVをディープラーニングで解析しMIDI化 (Dockerコンテナ)
+//   4. C# 整形       : Omnizart出力MIDIを読み込み、Cakewalk向けに整形して再出力
+//   5. Cakewalk SONAR: MIDIを読み込む
 //
 // 必要環境:
 //   - .NET 8 SDK
 //   - FFmpeg (ffmpeg.exe がPATH上にあること、または --ffmpeg で指定)
-//   - Python + Demucs (pip install -U demucs)
+//   - Python + Demucs (Demucs専用venv。例: C:\tools\demucs-env)
+//   - Docker Desktop (mctlab/omnizart イメージ使用)
+//       事前に1回だけ: docker pull mctlab/omnizart:latest
 //
 // 使い方:
 //   dotnet run -- "C:\path\to\song.mp3" 128
-//   dotnet run -- "C:\path\to\song.mp3" 128 --sensitivity 0.8 --quantize 32
-//   dotnet run -- "C:\path\to\song.mp3" 128 --ffmpeg "C:\tools\ffmpeg.exe" --keep-temp
+//   dotnet run -- "C:\path\to\song.mp3" 128 --output "MyDrumTrack" --keep-temp
+//   dotnet run -- "C:\path\to\song.mp3" 128 --python "C:\tools\demucs-env\Scripts\python.exe"
 //
 // 出力:
 //   入力MP3と同じフォルダに "<元ファイル名>_drums.mid" が生成されます。
@@ -26,7 +29,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Numerics;
 
 namespace DrumMidiGenerator
 {
@@ -37,12 +39,13 @@ namespace DrumMidiGenerator
             if (args.Length < 1)
             {
                 Console.WriteLine("使い方: DrumMidiGenerator <input.mp3> [bpm] [options]");
-                Console.WriteLine("  bpm              : 元曲のテンポ (省略時 128)");
+                Console.WriteLine("  bpm              : 元曲のテンポ (省略時 128。Omnizart出力には直接使われず、参考表示用)");
                 Console.WriteLine("  --ffmpeg path    : ffmpeg実行ファイルのパス (省略時 'ffmpeg')");
-                Console.WriteLine("  --python path    : python実行ファイルのパス (省略時 'python')");
+                Console.WriteLine("  --python path    : Demucs用python実行ファイルのパス (省略時 'python')");
                 Console.WriteLine("  --model name     : Demucsモデル名 (省略時 'htdemucs')");
-                Console.WriteLine("  --sensitivity x  : オンセット検出感度 (省略時 1.0。小さいほど多く検出される)");
-                Console.WriteLine("  --quantize n     : ノートをn分音符グリッドにスナップ (例: 16, 32。省略時スナップなし)");
+                Console.WriteLine("  --docker path    : docker実行ファイルのパス (省略時 'docker')");
+                Console.WriteLine("  --docker-image n : Omnizart Dockerイメージ名 (省略時 'mctlab/omnizart:latest')");
+                Console.WriteLine("  --velocity-scale x : 出力ベロシティの倍率 (省略時 1.0)");
                 Console.WriteLine("  --output path    : 出力MIDIファイルのパス/ファイル名 (省略時 '<入力名>_drums.mid')");
                 Console.WriteLine("  --keep-temp      : 作業用の中間ファイルを削除しない");
                 return 1;
@@ -53,8 +56,9 @@ namespace DrumMidiGenerator
             string ffmpegPath = "ffmpeg";
             string pythonPath = "python";
             string demucsModel = "htdemucs";
-            double sensitivity = 1.0;
-            int quantizeDivision = 0;
+            string dockerPath = "docker";
+            string dockerImage = "mctlab/omnizart:latest";
+            double velocityScale = 1.0;
             string? outputPath = null;
             bool keepTemp = false;
 
@@ -70,8 +74,9 @@ namespace DrumMidiGenerator
                     case "--ffmpeg" when i + 1 < args.Length: ffmpegPath = args[++i]; break;
                     case "--python" when i + 1 < args.Length: pythonPath = args[++i]; break;
                     case "--model" when i + 1 < args.Length: demucsModel = args[++i]; break;
-                    case "--sensitivity" when i + 1 < args.Length: sensitivity = double.Parse(args[++i]); break;
-                    case "--quantize" when i + 1 < args.Length: quantizeDivision = int.Parse(args[++i]); break;
+                    case "--docker" when i + 1 < args.Length: dockerPath = args[++i]; break;
+                    case "--docker-image" when i + 1 < args.Length: dockerImage = args[++i]; break;
+                    case "--velocity-scale" when i + 1 < args.Length: velocityScale = double.Parse(args[++i]); break;
                     case "--output" when i + 1 < args.Length: outputPath = args[++i]; break;
                     case "--keep-temp": keepTemp = true; break;
                 }
@@ -101,31 +106,31 @@ namespace DrumMidiGenerator
                 string drumsWavPath = DemucsSeparator.SeparateDrums(wavPath, workDir, pythonPath, demucsModel);
                 Console.WriteLine($"  -> {drumsWavPath}");
 
-                // --- 3. 解析: オンセット検出 + 楽器分類 ---
-                Console.WriteLine("[3/4] ドラムWAVを解析中...");
-                var wav = WavFile.Load(drumsWavPath);
-                var detector = new OnsetDetector(sensitivity);
-                var onsets = detector.Detect(wav);
+                // --- 3. Omnizart: ディープラーニングでドラム解析 -> MIDI ---
+                Console.WriteLine("[3/4] Omnizart (Docker) でドラムを解析中... (初回はモデル読み込みに時間がかかります)");
+                string omnizartMidiPath = OmnizartTranscriber.Transcribe(drumsWavPath, workDir, dockerPath, dockerImage);
+                Console.WriteLine($"  -> {omnizartMidiPath}");
 
-                int kicks = onsets.Count(o => o.MidiNote == DrumMap.Kick);
-                int snares = onsets.Count(o => o.MidiNote == DrumMap.Snare);
-                int hihats = onsets.Count(o => o.MidiNote == DrumMap.ClosedHiHat);
-                Console.WriteLine($"  検出オンセット数: {onsets.Count}  (Kick:{kicks} / Snare:{snares} / HiHat:{hihats})");
+                // --- 4. MIDI読み込み + 整形 + 再出力 ---
+                Console.WriteLine("[4/4] MIDIをCakewalk向けに整形中...");
+                var notes = MidiReader.ReadDrumNotes(omnizartMidiPath);
+                Console.WriteLine($"  読み込みノート数: {notes.Count}");
 
-                // --- 4. MIDI出力 ---
-                Console.WriteLine("[4/4] MIDIファイルを生成中...");
+                if (Math.Abs(velocityScale - 1.0) > 1e-9)
+                {
+                    foreach (var n in notes)
+                        n.Velocity = (int)Math.Clamp(n.Velocity * velocityScale, 1, 127);
+                }
+
+                int kicks = notes.Count(n => n.MidiNote == DrumMap.Kick);
+                int snares = notes.Count(n => n.MidiNote == DrumMap.Snare);
+                int hihats = notes.Count(n => n.MidiNote == DrumMap.ClosedHiHat || n.MidiNote == DrumMap.OpenHiHat);
+                int others = notes.Count - kicks - snares - hihats;
+                Console.WriteLine($"  内訳: Kick:{kicks} / Snare:{snares} / HiHat:{hihats} / その他:{others}");
+
                 string midiPath = ResolveOutputPath(outputPath, inputDir, baseName);
-                MidiWriter.Write(midiPath, onsets, bpm, quantizeDivision);
+                MidiWriter.Write(midiPath, notes, bpm);
                 Console.WriteLine($"完了: {midiPath}");
-
-                if (!keepTemp)
-                {
-                    try { Directory.Delete(workDir, true); } catch { /* 無視 */ }
-                }
-                else
-                {
-                    Console.WriteLine($"中間ファイルを保持しました: {workDir}");
-                }
 
                 return 0;
             }
@@ -133,6 +138,31 @@ namespace DrumMidiGenerator
             {
                 Console.WriteLine($"エラー: {ex.Message}");
                 return 1;
+            }
+            finally
+            {
+                // 正常終了・異常終了どちらの場合も作業フォルダを確実に削除する
+                if (!keepTemp)
+                {
+                    try
+                    {
+                        if (Directory.Exists(workDir))
+                        {
+                            Directory.Delete(workDir, true);
+                            Console.WriteLine("作業フォルダを削除しました。");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 削除失敗は警告に留める (ファイルロック中など)
+                        Console.WriteLine($"警告: 作業フォルダの削除に失敗しました ({workDir}): {ex.Message}");
+                        Console.WriteLine("  手動で削除してください。");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"中間ファイルを保持しました: {workDir}");
+                }
             }
         }
 
@@ -233,14 +263,12 @@ namespace DrumMidiGenerator
             }
             catch (Exception ex)
             {
-                throw new Exception($"Pythonを起動できません ('{pythonPath}'). 'pip install -U demucs' でインストール済みか確認してください。詳細: {ex.Message}");
+                throw new Exception($"Pythonを起動できません ('{pythonPath}'). Demucs用venvのpython.exeを --python で指定してください。詳細: {ex.Message}");
             }
 
             if (process == null)
                 throw new Exception("Demucsプロセスの起動に失敗しました。");
 
-            // Demucsの出力をリアルタイムでコンソールに表示しつつ、
-            // 末尾の数行をエラーメッセージ用に保持する
             process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine(e.Data); };
             process.ErrorDataReceived += (_, e) =>
             {
@@ -273,147 +301,109 @@ namespace DrumMidiGenerator
     }
 
     // =====================================================================
-    // WAVファイル読み込み (PCM 8/16/24/32bit -> モノラルfloat配列)
+    // Omnizart: ドラムのディープラーニング解析 (Dockerコンテナ呼び出し)
+    //
+    //   docker run --rm -v "<workDir>:/data" <image> omnizart drum transcribe
+    //       /data/<wavファイル名> --output /data/<出力ファイル名>
+    //
+    // Omnizartは内部でCNN+Attentionベースのモデルを使い、A2MDデータセット
+    // (約34時間のポップス楽曲)で学習済みのチェックポイントから推論する。
+    // 自前のFFTヒューリスティック解析よりも複雑なパターンへの頑健性が高い。
     // =====================================================================
-    class WavFile
+    static class OmnizartTranscriber
     {
-        public int SampleRate { get; private set; }
-        public int Channels { get; private set; }
-        public int BitsPerSample { get; private set; }
-        public float[] Samples { get; private set; } = Array.Empty<float>();
-
-        public static WavFile Load(string path)
+        public static string Transcribe(string drumsWavPath, string workDir, string dockerPath, string dockerImage)
         {
-            using var fs = File.OpenRead(path);
-            using var br = new BinaryReader(fs);
+            // Dockerにマウントするボリュームのホスト側パスと、コンテナ内でのファイル名を用意
+            string wavFileName = Path.GetFileName(drumsWavPath);
+            string outputFileName = Path.GetFileNameWithoutExtension(drumsWavPath) + "_omnizart.mid";
 
-            if (new string(br.ReadChars(4)) != "RIFF")
-                throw new InvalidDataException("RIFFファイルではありません。");
-            br.ReadInt32(); // ファイルサイズ
-            if (new string(br.ReadChars(4)) != "WAVE")
-                throw new InvalidDataException("WAVEファイルではありません。");
+            // Omnizartへの入力WAVはworkDir直下に既に存在する想定 (Demucsの出力をコピーしておく)
+            string containerInputDir = "/data";
+            string hostMountDir = Path.GetFullPath(workDir);
 
-            int sampleRate = 0, channels = 0, bitsPerSample = 0;
-            byte[]? data = null;
-
-            while (br.BaseStream.Position < br.BaseStream.Length)
+            // drums.wav は Demucs の出力サブフォルダ内にあるため、
+            // Dockerからマウントしやすいよう workDir 直下にコピーする
+            string localCopyPath = Path.Combine(workDir, wavFileName);
+            if (!string.Equals(Path.GetFullPath(localCopyPath), Path.GetFullPath(drumsWavPath), StringComparison.OrdinalIgnoreCase))
             {
-                if (br.BaseStream.Position + 8 > br.BaseStream.Length) break;
-
-                string chunkId = new string(br.ReadChars(4));
-                int chunkSize = br.ReadInt32();
-
-                if (chunkId == "fmt ")
-                {
-                    br.ReadInt16(); // format tag
-                    channels = br.ReadInt16();
-                    sampleRate = br.ReadInt32();
-                    br.ReadInt32(); // byte rate
-                    br.ReadInt16(); // block align
-                    bitsPerSample = br.ReadInt16();
-                    int remaining = chunkSize - 16;
-                    if (remaining > 0) br.ReadBytes(remaining);
-                }
-                else if (chunkId == "data")
-                {
-                    data = br.ReadBytes(chunkSize);
-                }
-                else
-                {
-                    br.ReadBytes(Math.Min(chunkSize, (int)(br.BaseStream.Length - br.BaseStream.Position)));
-                }
-
-                // チャンクは偶数バイト境界にパディングされる
-                if (chunkSize % 2 != 0 && br.BaseStream.Position < br.BaseStream.Length)
-                    br.ReadByte();
+                File.Copy(drumsWavPath, localCopyPath, overwrite: true);
             }
 
-            if (data == null) throw new InvalidDataException("dataチャンクが見つかりません。");
+            string containerWavPath = $"{containerInputDir}/{wavFileName}";
+            string containerOutputPath = $"{containerInputDir}/{outputFileName}";
 
-            return new WavFile
+            // Windowsのパスをdocker -vで使える形式に変換 (例: C:\foo\bar -> //c/foo/bar)
+            string dockerVolumeArg = ToDockerVolumePath(hostMountDir);
+
+            var psi = new ProcessStartInfo
             {
-                SampleRate = sampleRate,
-                Channels = channels,
-                BitsPerSample = bitsPerSample,
-                Samples = ConvertToMonoFloat(data, bitsPerSample, channels)
+                FileName = dockerPath,
+                Arguments = $"run --rm -v \"{dockerVolumeArg}:{containerInputDir}\" {dockerImage} " +
+                            $"omnizart drum transcribe \"{containerWavPath}\" --output \"{containerOutputPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
             };
-        }
 
-        private static float[] ConvertToMonoFloat(byte[] data, int bits, int channels)
-        {
-            if (channels <= 0) channels = 1;
-            int bytesPerSample = bits / 8;
-            if (bytesPerSample <= 0) bytesPerSample = 2;
-
-            int frameSize = bytesPerSample * channels;
-            int frameCount = data.Length / frameSize;
-            var result = new float[frameCount];
-
-            for (int i = 0; i < frameCount; i++)
+            Process? process;
+            var errorLines = new List<string>();
+            try
             {
-                float sum = 0;
-                for (int ch = 0; ch < channels; ch++)
-                {
-                    int offset = i * frameSize + ch * bytesPerSample;
-                    float sample = bits switch
-                    {
-                        8 => (data[offset] - 128) / 128f,
-                        16 => BitConverter.ToInt16(data, offset) / 32768f,
-                        24 => Decode24(data, offset) / 8388608f,
-                        32 => BitConverter.ToInt32(data, offset) / 2147483648f,
-                        _ => 0f
-                    };
-                    sum += sample;
-                }
-                result[i] = sum / channels;
+                process = Process.Start(psi);
             }
-            return result;
-        }
-
-        private static int Decode24(byte[] data, int offset)
-        {
-            int v = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
-            if ((v & 0x800000) != 0) v |= unchecked((int)0xFF000000); // 符号拡張
-            return v;
-        }
-    }
-
-    // =====================================================================
-    // FFT (Cooley-Tukey, 2の累乗サイズ専用)
-    // =====================================================================
-    static class FFT
-    {
-        public static void Transform(Complex[] buf)
-        {
-            int n = buf.Length;
-            if (n <= 1) return;
-
-            // ビット反転並べ替え
-            for (int i = 1, j = 0; i < n; i++)
+            catch (Exception ex)
             {
-                int bit = n >> 1;
-                for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-                j ^= bit;
-                if (i < j) (buf[i], buf[j]) = (buf[j], buf[i]);
+                throw new Exception($"Dockerを起動できません ('{dockerPath}'). Docker Desktopが起動しているか確認してください。詳細: {ex.Message}");
             }
 
-            for (int len = 2; len <= n; len <<= 1)
+            if (process == null)
+                throw new Exception("Omnizart (Docker) プロセスの起動に失敗しました。");
+
+            process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine(e.Data); };
+            process.ErrorDataReceived += (_, e) =>
             {
-                double ang = -2 * Math.PI / len;
-                var wlen = new Complex(Math.Cos(ang), Math.Sin(ang));
-                for (int i = 0; i < n; i += len)
-                {
-                    var w = Complex.One;
-                    for (int j = 0; j < len / 2; j++)
-                    {
-                        var u = buf[i + j];
-                        var v = buf[i + j + len / 2] * w;
-                        buf[i + j] = u + v;
-                        buf[i + j + len / 2] = u - v;
-                        w *= wlen;
-                    }
-                }
+                if (e.Data == null) return;
+                Console.WriteLine(e.Data);
+                errorLines.Add(e.Data);
+                if (errorLines.Count > 25) errorLines.RemoveAt(0);
+            };
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+            {
+                string detail = errorLines.Count > 0
+                    ? "\n--- Omnizart(Docker)出力(末尾) ---\n" + string.Join("\n", errorLines)
+                    : "";
+                throw new Exception(
+                    $"Omnizartの実行に失敗しました (終了コード: {process.ExitCode})。" +
+                    $"Docker Desktopの起動状態、および 'docker pull {dockerImage}' 実施済みかを確認してください。{detail}");
             }
+
+            string resultPath = Path.Combine(workDir, outputFileName);
+            if (!File.Exists(resultPath))
+                throw new FileNotFoundException($"Omnizartの出力ファイルが見つかりません: {resultPath}");
+
+            return resultPath;
+        }
+
+        /// <summary>
+        /// Windowsパス (例: C:\Users\foo\bar) を Docker Desktop (WSL2バックエンド) が
+        /// 解釈できる形式 (例: //c/Users/foo/bar) に変換する。
+        /// </summary>
+        private static string ToDockerVolumePath(string windowsPath)
+        {
+            string full = Path.GetFullPath(windowsPath).Replace('\\', '/');
+            if (full.Length >= 2 && full[1] == ':')
+            {
+                char drive = char.ToLowerInvariant(full[0]);
+                return $"//{drive}{full.Substring(2)}";
+            }
+            return full;
         }
     }
 
@@ -425,355 +415,219 @@ namespace DrumMidiGenerator
         public const int Kick = 36;        // Bass Drum 1
         public const int Snare = 38;       // Acoustic Snare
         public const int ClosedHiHat = 42; // Closed Hi-Hat
+        public const int OpenHiHat = 46;   // Open Hi-Hat
+        public const int CrashCymbal = 49; // Crash Cymbal 1
+        public const int RideCymbal = 51;  // Ride Cymbal 1
+        public const int LowTom = 45;
+        public const int MidTom = 47;
+        public const int HighTom = 50;
     }
 
     // =====================================================================
-    // 検出されたドラムオンセット1件分
+    // 読み込んだ/書き出すドラムノート1件分
     // =====================================================================
-    class Onset
+    class DrumNote
     {
-        public double TimeSeconds;
-        public double Strength;
+        public double StartSeconds;
+        public double DurationSeconds;
         public int MidiNote;
         public int Velocity;
     }
 
     // =====================================================================
-    // オンセット検出 + 楽器分類 (マルチバンド方式 + HFC + 中央値適応しきい値)
-    //
-    // アルゴリズム概要:
-    //  1. 全フレームのFFTマグニチュードを対数圧縮 log(1+|X|) してスペクトログラムを作成
-    //     -> 振幅の小さい音も検出しやすくするための圧縮
-    //  2. Kick/Snare/HiHatそれぞれの周波数帯ごとに、帯域限定の検出関数を計算:
-    //       - フラックス成分: log(1+|X|) の正の差分の和 (音色変化に敏感)
-    //       - HFC成分      : (bin番号で重み付けした) 振幅の差分の和 (高域の急峻なアタックに敏感)
-    //     2つを合成したものを最終的な検出関数として使用する
-    //     -> 1つの帯域が他帯域に埋もれて検出漏れするのを防ぐ (ポリフォニック検出)
-    //  3. 各帯域で「中央値 + MAD(中央絶対偏差) × 係数」による適応的しきい値でピーク検出
-    //     -> 平均値ベースに比べて突発的な大音量区間に閾値が引っ張られにくい
-    //  4. ピーク周辺3点の放物線補間でサブフレーム精度の発音時刻を推定
-    //  5. ピーク検出されたフレームについて、そのフレーム内で対象帯域のエネルギー比が
-    //     一定以上かを確認 (クロスバンド確認チェック)
-    //     -> 他楽器の過渡音が漏れ込んで誤検出するのを抑制
-    //  6. 楽器ごとに強度のパーセンタイル分布を使ってベロシティへマッピング
-    //     -> 曲全体の最大値1つに引っ張られず、強弱のレンジ全体を有効活用する
-    //  7. 極端に近接したノート(数msオーダー)をマージして冗長な発音を抑制
-    //
-    // 注意: ヒューリスティック(経験則)による分類です。クラッシュ/ライド/タムの区別、
-    //       オープン/クローズハイハットの判定などは含まれていません。
-    //       下記の定数を調整してチューニングしてください。
+    // 標準MIDIファイル(SMF)読み込み (Omnizartの出力MIDIをパースするため)
+    //   - Format 0 / Format 1 の両方に対応
+    //   - 全トラックのNote On/Offイベントを統合して読み込む
+    //   - テンポ情報からtick単位を秒に変換する
     // =====================================================================
-    class OnsetDetector
+    static class MidiReader
     {
-        private const int WindowSize = 2048; // FFTサイズ
-        private const int HopSize = 512;     // フレーム間隔
-
-        // ピーク検出パラメータ
-        private const int PeakSpread = 2;         // 局所最大値判定の幅 (フレーム数)
-        private const int AdaptiveMedianWindow = 16; // 適応的しきい値の中央値計算窓 (片側フレーム数)
-
-        // 検出関数の合成比率 (フラックス成分 + HFC成分)
-        private const double HfcWeight = 0.6; // 0.0でフラックスのみ、大きいほどHFCの寄与が増える
-
-        // 周波数帯の境界 (Hz)
-        private const double KickLoHz = 20, KickHiHz = 150;
-        private const double SnareLoHz = 150, SnareHiHz = 2500;
-        private const double HiHatLoHz = 2500, HiHatHiHz = 12000;
-
-        // 帯域ごとのしきい値の係数 (MADに掛ける倍率。大きいほど検出されにくくなる)
-        private const double KickThresholdMul = 3.0;
-        private const double SnareThresholdMul = 3.2;
-        private const double HiHatThresholdMul = 3.5;
-
-        // 帯域ごとの最小オンセット間隔 (秒)
-        private const double KickMinGap = 0.08;
-        private const double SnareMinGap = 0.06;
-        private const double HiHatMinGap = 0.04;
-
-        // クロスバンド確認チェック: そのフレームで対象帯域のエネルギー比が
-        // この値未満なら誤検出として捨てる (0.0〜1.0)
-        private const double KickRatioMin = 0.35;
-        private const double SnareRatioMin = 0.20;
-        private const double HiHatRatioMin = 0.30;
-
-        // ベロシティの最小値・最大値
-        private const int VelocityMin = 45;
-        private const int VelocityRange = 82; // VelocityMin + VelocityRange = 127
-
-        // 異なる楽器間でこの間隔(秒)未満で連続する場合、弱い方をゴーストノートとして抑制
-        private const double MergeWindowSeconds = 0.012;
-
-        private readonly double _sensitivity;
-
-        /// <param name="sensitivity">検出感度の倍率。1.0が標準。小さいほど多く検出される。</param>
-        public OnsetDetector(double sensitivity = 1.0)
+        public static List<DrumNote> ReadDrumNotes(string path)
         {
-            _sensitivity = sensitivity <= 0 ? 1.0 : sensitivity;
-        }
+            using var fs = File.OpenRead(path);
+            using var br = new BinaryReader(fs);
 
-        public List<Onset> Detect(WavFile wav)
-        {
-            float[] samples = wav.Samples;
-            int sr = wav.SampleRate;
-            int numFrames = (samples.Length - WindowSize) / HopSize + 1;
-            if (numFrames <= 0) return new List<Onset>();
+            if (new string(ReadChars(br, 4)) != "MThd")
+                throw new InvalidDataException("MThdチャンクが見つかりません。MIDIファイルではない可能性があります。");
 
-            // --- スペクトログラム (生マグニチュード + 対数圧縮マグニチュード) を作成 ---
-            double[] window = HannWindow(WindowSize);
-            var mag = new double[numFrames][];
-            var logMag = new double[numFrames][];
+            int headerLen = ReadInt32BE(br);
+            short format = ReadInt16BE(br);
+            short numTracks = ReadInt16BE(br);
+            short division = ReadInt16BE(br);
+            if (headerLen > 6) br.ReadBytes(headerLen - 6);
 
-            for (int f = 0; f < numFrames; f++)
+            if (division < 0)
+                throw new NotSupportedException("SMPTEタイムフォーマットのMIDIには対応していません。");
+
+            int ticksPerQuarter = division;
+
+            // 全トラックのイベントを (tick, ...) で集約
+            var tempoChanges = new List<(long tick, int microsPerQuarter)> { (0, 500000) }; // デフォルト120BPM
+            var noteEvents = new List<(long tick, int note, int velocity, bool isOn)>();
+
+            for (int t = 0; t < numTracks; t++)
             {
-                int start = f * HopSize;
-                var buf = new Complex[WindowSize];
-                for (int i = 0; i < WindowSize; i++)
+                string chunkId = new string(ReadChars(br, 4));
+                int chunkLen = ReadInt32BE(br);
+                long chunkEnd = br.BaseStream.Position + chunkLen;
+
+                if (chunkId != "MTrk")
                 {
-                    int idx = start + i;
-                    double s = idx < samples.Length ? samples[idx] : 0.0;
-                    buf[i] = new Complex(s * window[i], 0);
+                    br.BaseStream.Seek(chunkLen, SeekOrigin.Current);
+                    continue;
                 }
-                FFT.Transform(buf);
 
-                var m = new double[WindowSize / 2];
-                var lm = new double[WindowSize / 2];
-                for (int i = 0; i < m.Length; i++)
+                long tick = 0;
+                byte runningStatus = 0;
+
+                while (br.BaseStream.Position < chunkEnd)
                 {
-                    m[i] = buf[i].Magnitude;
-                    lm[i] = Math.Log(1.0 + m[i]);
+                    long delta = ReadVarLen(br);
+                    tick += delta;
+
+                    byte statusByte = br.ReadByte();
+                    byte status;
+
+                    if (statusByte < 0x80)
+                    {
+                        // ランニングステータス: ステータスバイト省略、直前のものを再利用
+                        status = runningStatus;
+                        br.BaseStream.Seek(-1, SeekOrigin.Current);
+                    }
+                    else
+                    {
+                        status = statusByte;
+                        runningStatus = status;
+                    }
+
+                    int hi = status & 0xF0;
+
+                    if (status == 0xFF)
+                    {
+                        // メタイベント
+                        byte metaType = br.ReadByte();
+                        long len = ReadVarLen(br);
+                        byte[] data = br.ReadBytes((int)len);
+
+                        if (metaType == 0x51 && data.Length == 3) // Set Tempo
+                        {
+                            int micros = (data[0] << 16) | (data[1] << 8) | data[2];
+                            tempoChanges.Add((tick, micros));
+                        }
+                    }
+                    else if (status == 0xF0 || status == 0xF7)
+                    {
+                        // SysExイベント
+                        long len = ReadVarLen(br);
+                        br.ReadBytes((int)len);
+                    }
+                    else if (hi == 0x90 || hi == 0x80)
+                    {
+                        // Note On / Note Off
+                        int note = br.ReadByte();
+                        int velocity = br.ReadByte();
+                        bool isOn = hi == 0x90 && velocity > 0;
+                        noteEvents.Add((tick, note, velocity, isOn));
+                    }
+                    else
+                    {
+                        // その他のチャンネルメッセージ (Control Change等): データバイト数をスキップ
+                        int dataBytes = GetChannelMessageDataBytes(hi);
+                        for (int k = 0; k < dataBytes; k++) br.ReadByte();
+                    }
                 }
-                mag[f] = m;
-                logMag[f] = lm;
+
+                br.BaseStream.Position = chunkEnd;
             }
 
-            int numBins = logMag[0].Length;
-            double binHz = (double)sr / WindowSize;
-            int B(double hz) => Math.Clamp((int)(hz / binHz), 0, numBins - 1);
+            tempoChanges.Sort((a, b) => a.tick.CompareTo(b.tick));
 
-            int kickLo = B(KickLoHz), kickHi = B(KickHiHz);
-            int snareLo = B(SnareLoHz), snareHi = B(SnareHiHz);
-            int hihatLo = B(HiHatLoHz), hihatHi = B(HiHatHiHz);
-
-            // クロスバンド比較に使う全体範囲 (打楽器が主に存在する帯域)
-            int totalLo = kickLo, totalHi = hihatHi;
-
-            var kickOnsets = DetectBand(mag, logMag, numFrames, sr, kickLo, kickHi,
-                KickThresholdMul, KickMinGap, DrumMap.Kick,
-                f => BandRatio(logMag[f], kickLo, kickHi, totalLo, totalHi) >= KickRatioMin);
-
-            var snareOnsets = DetectBand(mag, logMag, numFrames, sr, snareLo, snareHi,
-                SnareThresholdMul, SnareMinGap, DrumMap.Snare,
-                f => BandRatio(logMag[f], snareLo, snareHi, totalLo, totalHi) >= SnareRatioMin);
-
-            var hihatOnsets = DetectBand(mag, logMag, numFrames, sr, hihatLo, hihatHi,
-                HiHatThresholdMul, HiHatMinGap, DrumMap.ClosedHiHat,
-                f => BandRatio(logMag[f], hihatLo, hihatHi, totalLo, totalHi) >= HiHatRatioMin);
-
-            // 楽器ごとにパーセンタイル分布を使ってベロシティをマッピング
-            MapVelocityByPercentile(kickOnsets);
-            MapVelocityByPercentile(snareOnsets);
-            MapVelocityByPercentile(hihatOnsets);
-
-            var all = new List<Onset>();
-            all.AddRange(kickOnsets);
-            all.AddRange(snareOnsets);
-            all.AddRange(hihatOnsets);
-            all.Sort((a, b) => a.TimeSeconds.CompareTo(b.TimeSeconds));
-
-            return MergeGhostNotes(all);
-        }
-
-        /// <summary>
-        /// 指定した周波数帯について「対数フラックス + HFC」の合成検出関数を計算し、
-        /// 中央値+MADベースの適応的しきい値でピーク検出を行う。
-        /// confirmCheckで誤検出を除外し、放物線補間でサブフレーム精度の時刻を求める。
-        /// </summary>
-        private List<Onset> DetectBand(
-            double[][] mag, double[][] logMag, int numFrames, int sr,
-            int bandLo, int bandHi, double thresholdMul, double minGapSec, int midiNote,
-            Func<int, bool> confirmCheck)
-        {
-            var result = new List<Onset>();
-
-            // 対数フラックス成分とHFC成分を正規化した上で合成した検出関数
-            double[] detFunc = CombineNormalized(mag, logMag, numFrames, bandLo, bandHi);
-
-            double maxDet = detFunc.Length > 0 ? detFunc.Max() : 0;
-            if (maxDet <= 0) return result;
-
-            double lastTime = -1;
-            for (int f = PeakSpread; f < numFrames - PeakSpread; f++)
+            // tick -> 秒変換用のヘルパー
+            double TickToSeconds(long targetTick)
             {
-                bool isPeak = true;
-                for (int k = -PeakSpread; k <= PeakSpread; k++)
+                double seconds = 0;
+                long lastTick = 0;
+                int currentMicros = 500000;
+
+                foreach (var (tick, micros) in tempoChanges)
                 {
-                    if (k != 0 && detFunc[f] < detFunc[f + k]) { isPeak = false; break; }
+                    if (tick >= targetTick) break;
+                    seconds += (tick - lastTick) * (currentMicros / 1_000_000.0) / ticksPerQuarter;
+                    lastTick = tick;
+                    currentMicros = micros;
                 }
-                if (!isPeak || detFunc[f] <= 0) continue;
-
-                int lo = Math.Max(0, f - AdaptiveMedianWindow);
-                int hi = Math.Min(numFrames - 1, f + AdaptiveMedianWindow);
-                double median = Median(detFunc, lo, hi);
-                double mad = MedianAbsoluteDeviation(detFunc, lo, hi, median);
-
-                // MADが極端に小さい(無音区間など)場合のフォールバック
-                double effectiveMad = Math.Max(mad, maxDet * 0.005);
-                double threshold = (median + effectiveMad * thresholdMul) * _sensitivity;
-                if (detFunc[f] <= threshold) continue;
-
-                // 放物線補間でサブフレーム精度のピーク位置を推定
-                double frac = ParabolicInterpolationOffset(detFunc[f - 1], detFunc[f], detFunc[f + 1]);
-                double time = ((f + frac) * HopSize) / sr;
-
-                if (lastTime >= 0 && (time - lastTime) < minGapSec) continue;
-                if (!confirmCheck(f)) continue;
-
-                result.Add(new Onset
-                {
-                    TimeSeconds = Math.Max(0, time),
-                    Strength = detFunc[f],
-                    MidiNote = midiNote,
-                    Velocity = 0
-                });
-                lastTime = time;
+                seconds += (targetTick - lastTick) * (currentMicros / 1_000_000.0) / ticksPerQuarter;
+                return seconds;
             }
 
-            return result;
-        }
+            // Note On/Offをペアリングしてノート区間を作る (note番号ごとにスタックで対応)
+            noteEvents.Sort((a, b) => a.tick.CompareTo(b.tick));
+            var pending = new Dictionary<int, Queue<(long tick, int velocity)>>();
+            var notes = new List<DrumNote>();
 
-        /// <summary>
-        /// 対数フラックス成分とHFC成分をそれぞれ独立に正規化してから合成する。
-        /// スケールの異なる2つの検出関数を公平に足し合わせるための処理。
-        /// </summary>
-        private double[] CombineNormalized(double[][] mag, double[][] logMag, int numFrames, int bandLo, int bandHi)
-        {
-            var fluxArr = new double[numFrames];
-            var hfcArr = new double[numFrames];
-
-            for (int f = 1; f < numFrames; f++)
+            foreach (var (tick, note, velocity, isOn) in noteEvents)
             {
-                double fluxSum = 0, hfcSum = 0;
-                var prevLog = logMag[f - 1];
-                var curLog = logMag[f];
-                var prevMag = mag[f - 1];
-                var curMag = mag[f];
-
-                for (int i = bandLo; i <= bandHi; i++)
+                if (isOn)
                 {
-                    double fluxDiff = curLog[i] - prevLog[i];
-                    if (fluxDiff > 0) fluxSum += fluxDiff;
-
-                    double hfcDiff = curMag[i] - prevMag[i];
-                    if (hfcDiff > 0) hfcSum += hfcDiff * (i + 1);
+                    if (!pending.TryGetValue(note, out var q))
+                    {
+                        q = new Queue<(long, int)>();
+                        pending[note] = q;
+                    }
+                    q.Enqueue((tick, velocity));
                 }
-                fluxArr[f] = fluxSum;
-                hfcArr[f] = hfcSum;
+                else
+                {
+                    if (pending.TryGetValue(note, out var q) && q.Count > 0)
+                    {
+                        var (onTick, onVelocity) = q.Dequeue();
+                        double startSec = TickToSeconds(onTick);
+                        double endSec = TickToSeconds(tick);
+                        notes.Add(new DrumNote
+                        {
+                            StartSeconds = startSec,
+                            DurationSeconds = Math.Max(0.01, endSec - startSec),
+                            MidiNote = note,
+                            Velocity = onVelocity
+                        });
+                    }
+                }
             }
 
-            double fluxMax = fluxArr.Max();
-            double hfcMax = hfcArr.Max();
-            if (fluxMax <= 0) fluxMax = 1;
-            if (hfcMax <= 0) hfcMax = 1;
+            notes.Sort((a, b) => a.StartSeconds.CompareTo(b.StartSeconds));
+            return notes;
+        }
 
-            var combined = new double[numFrames];
-            for (int f = 0; f < numFrames; f++)
+        private static int GetChannelMessageDataBytes(int statusHighNibble) => statusHighNibble switch
+        {
+            0xC0 or 0xD0 => 1, // Program Change, Channel Pressure
+            _ => 2             // Note On/Off, Control Change, Pitch Bend, Polyphonic Aftertouch
+        };
+
+        private static char[] ReadChars(BinaryReader br, int count) => br.ReadChars(count);
+
+        private static int ReadInt32BE(BinaryReader br)
+        {
+            byte[] b = br.ReadBytes(4);
+            return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+        }
+
+        private static short ReadInt16BE(BinaryReader br)
+        {
+            byte[] b = br.ReadBytes(2);
+            return (short)((b[0] << 8) | b[1]);
+        }
+
+        private static long ReadVarLen(BinaryReader br)
+        {
+            long value = 0;
+            byte b;
+            do
             {
-                double nf = fluxArr[f] / fluxMax;
-                double nh = hfcArr[f] / hfcMax;
-                combined[f] = (1.0 - HfcWeight) * nf + HfcWeight * nh;
-            }
-            return combined;
-        }
-
-        /// <summary>
-        /// y0,y1,y2 (フレーム f-1, f, f+1 の値) から放物線補間し、
-        /// フレームfからのオフセット(-0.5〜+0.5程度)を返す。
-        /// </summary>
-        private static double ParabolicInterpolationOffset(double y0, double y1, double y2)
-        {
-            double denom = y0 - 2 * y1 + y2;
-            if (Math.Abs(denom) < 1e-12) return 0.0;
-            double offset = 0.5 * (y0 - y2) / denom;
-            return Math.Clamp(offset, -0.5, 0.5);
-        }
-
-        private static double Median(double[] arr, int lo, int hi)
-        {
-            var slice = new double[hi - lo + 1];
-            Array.Copy(arr, lo, slice, 0, slice.Length);
-            Array.Sort(slice);
-            int n = slice.Length;
-            return n % 2 == 1 ? slice[n / 2] : (slice[n / 2 - 1] + slice[n / 2]) / 2.0;
-        }
-
-        private static double MedianAbsoluteDeviation(double[] arr, int lo, int hi, double median)
-        {
-            var dev = new double[hi - lo + 1];
-            for (int i = lo; i <= hi; i++) dev[i - lo] = Math.Abs(arr[i] - median);
-            Array.Sort(dev);
-            int n = dev.Length;
-            double mad = n % 2 == 1 ? dev[n / 2] : (dev[n / 2 - 1] + dev[n / 2]) / 2.0;
-            return mad * 1.4826; // 正規分布を仮定した標準偏差相当へのスケーリング
-        }
-
-        /// <summary>
-        /// フレーム内で [lo,hi] の帯域が、[totalLo,totalHi] の全体範囲に対して
-        /// どれだけの割合を占めているかを返す (0.0〜1.0)。
-        /// </summary>
-        private static double BandRatio(double[] frame, int lo, int hi, int totalLo, int totalHi)
-        {
-            double bandSum = 0, totalSum = 1e-9;
-            for (int i = totalLo; i <= totalHi; i++) totalSum += frame[i];
-            for (int i = lo; i <= hi; i++) bandSum += frame[i];
-            return bandSum / totalSum;
-        }
-
-        /// <summary>
-        /// 強度のパーセンタイル順位を使ってベロシティにマッピングする。
-        /// 1曲の中の最大値1点に引っ張られず、強弱のレンジを有効活用できる。
-        /// </summary>
-        private static void MapVelocityByPercentile(List<Onset> onsets)
-        {
-            if (onsets.Count == 0) return;
-            var sorted = onsets.OrderBy(o => o.Strength).ToList();
-            int n = sorted.Count;
-            for (int i = 0; i < n; i++)
-            {
-                double percentile = n == 1 ? 1.0 : (double)i / (n - 1);
-                sorted[i].Velocity = (int)Math.Clamp(VelocityMin + percentile * VelocityRange, 1, 127);
-            }
-        }
-
-        /// <summary>
-        /// 異なる楽器のノートが極端に近接している場合、弱い方をゴーストノートとして除去する。
-        /// 同一楽器内の連打(16分のハイハットなど)は対象外。
-        /// </summary>
-        private static List<Onset> MergeGhostNotes(List<Onset> sortedOnsets)
-        {
-            if (sortedOnsets.Count < 2) return sortedOnsets;
-
-            var result = new List<Onset>(sortedOnsets);
-            for (int i = 0; i < result.Count - 1; i++)
-            {
-                var a = result[i];
-                var b = result[i + 1];
-                if (a.MidiNote == b.MidiNote) continue; // 同一楽器は対象外
-                if ((b.TimeSeconds - a.TimeSeconds) >= MergeWindowSeconds) continue;
-
-                // 弱い方を除去
-                var weaker = a.Velocity <= b.Velocity ? a : b;
-                result.Remove(weaker);
-                i = Math.Max(-1, i - 1); // 削除した分インデックスを調整して再評価
-            }
-            return result;
-        }
-
-        private static double[] HannWindow(int size)
-        {
-            var w = new double[size];
-            for (int i = 0; i < size; i++)
-                w[i] = 0.5 * (1 - Math.Cos(2 * Math.PI * i / (size - 1)));
-            return w;
+                b = br.ReadByte();
+                value = (value << 7) | (uint)(b & 0x7F);
+            } while ((b & 0x80) != 0);
+            return value;
         }
     }
 
@@ -785,13 +639,8 @@ namespace DrumMidiGenerator
     static class MidiWriter
     {
         private const int TicksPerQuarter = 480;
-        private const int NoteLengthTicks = 60; // 32分音符程度の長さ
 
-        /// <param name="quantizeDivision">
-        /// 0以下の場合はスナップなし。8/16/32などを指定すると、その分音符グリッドに
-        /// オンセット時間をスナップする (例: 16 -> 16分音符単位)。
-        /// </param>
-        public static void Write(string path, List<Onset> onsets, double bpm, int quantizeDivision = 0)
+        public static void Write(string path, List<DrumNote> notes, double bpm)
         {
             using var fs = new FileStream(path, FileMode.Create);
             using var bw = new BinaryWriter(fs);
@@ -801,7 +650,7 @@ namespace DrumMidiGenerator
             var tempoTrack = BuildTempoTrack(bpm);
             WriteTrackChunk(bw, tempoTrack);
 
-            var drumTrack = BuildDrumTrack(onsets, bpm, quantizeDivision);
+            var drumTrack = BuildDrumTrack(notes, bpm);
             WriteTrackChunk(bw, drumTrack);
         }
 
@@ -836,7 +685,7 @@ namespace DrumMidiGenerator
             return ms.ToArray();
         }
 
-        private static byte[] BuildDrumTrack(List<Onset> onsets, double bpm, int quantizeDivision)
+        private static byte[] BuildDrumTrack(List<DrumNote> notes, double bpm)
         {
             using var ms = new MemoryStream();
             using var bw = new BinaryWriter(ms);
@@ -844,20 +693,16 @@ namespace DrumMidiGenerator
             var events = new List<(int tick, byte status, byte note, byte velocity)>();
             double ticksPerSecond = (bpm / 60.0) * TicksPerQuarter;
 
-            // quantizeDivision (例: 16, 32) からグリッド幅(tick)を算出
-            int gridTicks = quantizeDivision > 0 ? Math.Max(1, (TicksPerQuarter * 4) / quantizeDivision) : 0;
-
-            foreach (var o in onsets)
+            foreach (var n in notes)
             {
-                int startTick = (int)Math.Round(o.TimeSeconds * ticksPerSecond);
-                if (gridTicks > 0)
-                    startTick = (int)Math.Round((double)startTick / gridTicks) * gridTicks;
+                int startTick = (int)Math.Round(n.StartSeconds * ticksPerSecond);
+                int durTicks = Math.Max(10, (int)Math.Round(n.DurationSeconds * ticksPerSecond));
 
-                byte note = (byte)o.MidiNote;
-                byte vel = (byte)Math.Clamp(o.Velocity, 1, 127);
+                byte note = (byte)Math.Clamp(n.MidiNote, 0, 127);
+                byte vel = (byte)Math.Clamp(n.Velocity, 1, 127);
 
-                events.Add((startTick, 0x99, note, vel));               // Note On  (channel 10)
-                events.Add((startTick + NoteLengthTicks, 0x89, note, 0)); // Note Off (channel 10)
+                events.Add((startTick, 0x99, note, vel));                  // Note On  (channel 10)
+                events.Add((startTick + durTicks, 0x89, note, 0));         // Note Off (channel 10)
             }
 
             events.Sort((a, b) => a.tick.CompareTo(b.tick));
